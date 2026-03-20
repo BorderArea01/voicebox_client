@@ -22,14 +22,28 @@ except json.JSONDecodeError as e:
     print(f"[!] 错误: 配置文件格式不正确 {CONFIG_PATH}\n详细信息: {e}")
     exit(1)
 
-MQTT_BROKER = _config.get("MQTT_BROKER", "192.168.11.24")
-MQTT_PORT = _config.get("MQTT_PORT", 1883)
-MQTT_USER = _config.get("MQTT_USER", "")
-MQTT_PASS = _config.get("MQTT_PASS", "")
-MQTT_TOPIC = _config.get("MQTT_TOPIC", "soul2user")
+# MQTT 配置
+_mqtt_cfg = _config["MQTT"]
+MQTT_BROKER = _mqtt_cfg["BROKER"]
+MQTT_PORT = _mqtt_cfg["PORT"]
+MQTT_USER = _mqtt_cfg["USER"]
+MQTT_PASS = _mqtt_cfg["PASS"]
+MQTT_TOPIC = _mqtt_cfg["TOPIC"]
 
-VOICEBOX_URL = _config.get("VOICEBOX_URL", "http://192.168.2.236:17493")
-TARGET_DEMP_ID = _config.get("TARGET_DEMP_ID", "1976222524412792833")
+# Voicebox 配置
+_vb_cfg = _config["VOICEBOX"]
+VOICEBOX_URL = _vb_cfg["URL"]
+PROFILE_INDEX = _vb_cfg["PROFILE_INDEX"]
+TTS_PARAMS = _vb_cfg["TTS_PARAMS"]
+
+# App 运行配置
+_app_cfg = _config["APP"]
+TARGET_DEMP_ID = _app_cfg["TARGET_DEMP_ID"]
+TARGET_MSG_TYPE = _app_cfg["TARGET_MSG_TYPE"]
+MAX_WORKERS = _app_cfg["MAX_WORKERS"]
+CHUNK_SIZE = _app_cfg["CHUNK_SIZE"]
+FRAMES_PER_BUFFER = _app_cfg["FRAMES_PER_BUFFER"]
+REQ_TIMEOUT = _app_cfg["TIMEOUT"]
 
 # 全局队列和状态
 class SentenceItem:
@@ -39,7 +53,7 @@ class SentenceItem:
         self.chunk_queue = queue.Queue() # 用于存放该句子的音频块，容量无限
 
 sentence_queue = queue.Queue() # 用于保持句子的播放顺序
-tts_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3) # 允许3个并发请求，提前合成后续句子
+tts_executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) # 允许并发请求，提前合成后续句子
 http_session = requests.Session() # 使用 Session 保持长连接，省去每次请求 TCP/HTTP 握手的耗时
 text_buffer = ""
 profile_id = "default"
@@ -78,12 +92,15 @@ def interrupt_playback():
         current_stream.stop_stream()
 
 def get_first_profile_id():
-    """尝试获取 Voicebox 的默认 profile_id"""
+    """尝试获取 Voicebox 的配置 profile_id"""
     try:
-        response = http_session.get(f"{VOICEBOX_URL}/profiles", timeout=3)
+        response = http_session.get(f"{VOICEBOX_URL}/profiles", timeout=REQ_TIMEOUT)
         if response.status_code == 200:
             profiles = response.json()
-            if profiles and isinstance(profiles, list) and len(profiles) > 0:
+            if profiles and isinstance(profiles, list) and len(profiles) > PROFILE_INDEX:
+                return profiles[PROFILE_INDEX].get("id", "default")
+            elif profiles and isinstance(profiles, list) and len(profiles) > 0:
+                print(f"[*] 警告: 配置的 PROFILE_INDEX ({PROFILE_INDEX}) 超出范围，使用默认第一个。")
                 return profiles[0].get("id", "default")
     except Exception as e:
         print(f"[*] 获取 Profile 失败: {e}")
@@ -105,18 +122,18 @@ def fetch_tts_stream_to_item(item):
     payload = {
         "profile_id": profile_id,
         "text": text,
-        "language": "zh",
-        "seed": 0,
-        "model_size": "1.7B",
-        "engine": "qwen",
-        "max_chunk_chars": 800,
-        "crossfade_ms": 50,
-        "normalize": True,
-        "effects_chain": []
+        "language": TTS_PARAMS.get("language", "zh"),
+        "seed": TTS_PARAMS.get("seed", 0),
+        "model_size": TTS_PARAMS.get("model_size", "1.7B"),
+        "engine": TTS_PARAMS.get("engine", "qwen"),
+        "max_chunk_chars": TTS_PARAMS.get("max_chunk_chars", 800),
+        "crossfade_ms": TTS_PARAMS.get("crossfade_ms", 50),
+        "normalize": TTS_PARAMS.get("normalize", True),
+        "effects_chain": TTS_PARAMS.get("effects_chain", [])
     }
     
     try:
-        response = http_session.post(url, json=payload, stream=True)
+        response = http_session.post(url, json=payload, stream=True, timeout=REQ_TIMEOUT)
         if response.status_code != 200:
             print(f"[!] TTS 请求失败: {response.status_code}")
             item.chunk_queue.put({"type": "error"})
@@ -126,7 +143,7 @@ def fetch_tts_stream_to_item(item):
         header_parsed = False
         
         # 增大 chunk_size 可以更高效地读取数据
-        for chunk in response.iter_content(chunk_size=4096):
+        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
             if item.session_id != global_session_id: # 如果在下载过程中被打断，立即中止
                 break
                 
@@ -205,7 +222,7 @@ def audio_play_worker():
                         channels=current_format["channels"],
                         rate=current_format["rate"],
                         output=True,
-                        frames_per_buffer=4096 # 增加硬件缓冲区，减少爆音和卡顿
+                        frames_per_buffer=FRAMES_PER_BUFFER # 增加硬件缓冲区，减少爆音和卡顿
                     )
                     
             elif chunk_msg["type"] == "audio":
@@ -232,8 +249,8 @@ def on_message(client, userdata, msg):
             interrupt_playback()
             return
             
-        # 严格过滤：type == "0" 且 demp_id 匹配
-        if payload.get("type") == "0" and payload.get("demp_id") == TARGET_DEMP_ID:
+        # 严格过滤：type 与 demp_id 匹配
+        if payload.get("type") == TARGET_MSG_TYPE and payload.get("demp_id") == TARGET_DEMP_ID:
             content = payload.get("content", "")
             is_end = payload.get("is_end", False)
             
